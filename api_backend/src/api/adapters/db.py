@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
+from urllib.parse import urlparse, urlunparse
 
 import asyncpg
 
@@ -18,13 +19,51 @@ class DbPool:
 
 
 def _build_dsn(cfg: AppConfig) -> Optional[str]:
-    # Prefer POSTGRES_URL (as defined by work item db_env_vars).
-    # In postgres_db container, it is exported like: postgresql://localhost:PORT/DB_NAME
+    """Build a Postgres DSN from environment-driven config.
+
+    Why this exists:
+      - In the platform runtime, we may receive POSTGRES_URL as a host/db-only URL
+        like `postgresql://localhost:5000/myapp` (no credentials).
+      - asyncpg, when given a DSN without userinfo, falls back to the OS username.
+        That commonly fails in container environments (e.g., role "kavia" does not exist).
+      - Therefore: if POSTGRES_URL lacks credentials but POSTGRES_USER/PASSWORD are
+        provided, we inject them into the DSN.
+
+    Precedence rules:
+      1) If POSTGRES_URL includes username/password, use it as-is.
+      2) If POSTGRES_URL exists but has no username/password and POSTGRES_USER/PASSWORD
+         exist, inject them.
+      3) Otherwise, if POSTGRES_* parts are sufficient, build a DSN from parts.
+    """
     if cfg.postgres_url:
+        parsed = urlparse(cfg.postgres_url)
+
+        # Only attempt to inject creds for postgres schemes.
+        if parsed.scheme.startswith("postgres"):
+            has_userinfo = bool(parsed.username) or bool(parsed.password)
+            if (not has_userinfo) and cfg.postgres_user and cfg.postgres_password:
+                # Preserve host/port/path/query/fragment; inject userinfo.
+                netloc = parsed.hostname or ""
+                if parsed.port:
+                    netloc = f"{netloc}:{parsed.port}"
+                netloc = f"{cfg.postgres_user}:{cfg.postgres_password}@{netloc}"
+
+                return urlunparse(
+                    (
+                        parsed.scheme,
+                        netloc,
+                        parsed.path,
+                        parsed.params,
+                        parsed.query,
+                        parsed.fragment,
+                    )
+                )
+
         return cfg.postgres_url
-    # If POSTGRES_URL isn't provided, we *could* build from parts; but parts are optional.
+
     if cfg.postgres_user and cfg.postgres_password and cfg.postgres_db and cfg.postgres_port:
         return f"postgresql://{cfg.postgres_user}:{cfg.postgres_password}@localhost:{cfg.postgres_port}/{cfg.postgres_db}"
+
     return None
 
 
